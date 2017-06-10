@@ -1139,7 +1139,7 @@ static struct msm_bus_scale_pdata usb_bus_scale_pdata = {
 };
 
 static int phy_init_seq[] = {
-	0x68, 0x81, /* update DC voltage level */
+	0x6D, 0x81, /* update DC voltage level */
 	0x24, 0x82, /* set pre-emphasis and rise/fall time */
 	-1
 };
@@ -2453,7 +2453,7 @@ static struct msm_spm_platform_data msm_spm_l2_data[] __initdata = {
 	[0] = {
 		.reg_base_addr = MSM_SAW_L2_BASE,
 		.reg_init_values[MSM_SPM_REG_SAW2_SPM_CTL] = 0x00,
-		.reg_init_values[MSM_SPM_REG_SAW2_PMIC_DLY] = 0x02020207,
+		.reg_init_values[MSM_SPM_REG_SAW2_PMIC_DLY] = 0x02070207,
 		.reg_init_values[MSM_SPM_REG_SAW2_PMIC_DATA_0] = 0x00A000AE,
 		.reg_init_values[MSM_SPM_REG_SAW2_PMIC_DATA_1] = 0x00A00020,
 		.modes = msm_spm_l2_seq_list,
@@ -2950,7 +2950,7 @@ static struct msm_i2c_platform_data apq8064_i2c_qup_gsbi1_pdata = {
 };
 
 static struct msm_i2c_platform_data apq8064_i2c_qup_gsbi3_pdata = {
-	.clk_freq = 384000,
+	.clk_freq = 400000,
 	.src_clk_rate = 24000000,
 };
 
