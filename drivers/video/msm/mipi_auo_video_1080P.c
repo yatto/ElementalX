@@ -47,6 +47,8 @@ static int __init mipi_auo_video_1080p_init(void)
 	// TF700KL's setting
 	pinfo.xres = 1920;
 	pinfo.yres = 1200;
+	pinfo.width = 216;
+	pinfo.height = 135;
 
 	pinfo.type = MIPI_VIDEO_PANEL;
 	pinfo.pdest = DISPLAY_1;
