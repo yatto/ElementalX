@@ -1,0 +1,575 @@
+From e0599a7460af89e271f83c5ddf009da4ec1cd936 Mon Sep 17 00:00:00 2001
+From: yatto <yattodettaman@hotmail.com>
+Date: Tue, 7 Nov 2017 01:41:50 -0800
+Subject: [PATCH] Lineage Update up to efcb02f
+
+---
+ arch/arm/include/asm/unistd.h         |   9 ++
+ arch/arm/kernel/calls.S               |   1 +
+ arch/x86/syscalls/syscall_32.tbl      |   1 +
+ arch/x86/syscalls/syscall_64.tbl      |   1 +
+ drivers/char/random.c                 |  52 ++++++++++--
+ drivers/scsi/fcoe/fcoe_ctlr.c         |   4 +-
+ drivers/staging/android/uapi/binder.h |   2 +
+ include/asm-generic/unistd.h          |   4 +-
+ include/linux/random.h                |  35 ++++++--
+ include/linux/syscalls.h              |   4 +
+ lib/random32.c                        | 156 +++++++++++++++++++++++++++-------
+ 11 files changed, 220 insertions(+), 49 deletions(-)
+
+diff --git a/arch/arm/include/asm/unistd.h b/arch/arm/include/asm/unistd.h
+index 6ef9635a174d..21911d42a537 100644
+--- a/arch/arm/include/asm/unistd.h
++++ b/arch/arm/include/asm/unistd.h
+@@ -405,6 +405,7 @@
+ #define __NR_process_vm_readv		(__NR_SYSCALL_BASE+376)
+ #define __NR_process_vm_writev		(__NR_SYSCALL_BASE+377)
+ #define __NR_seccomp			(__NR_SYSCALL_BASE+383)
++#define __NR_getrandom			(__NR_SYSCALL_BASE+384)
+ 
+ /*
+  * The following SWIs are ARM private.
+@@ -417,6 +418,14 @@
+ #define __ARM_NR_set_tls		(__ARM_NR_BASE+5)
+ 
+ /*
++ * This may need to be greater than __NR_last_syscall+1 in order to
++ * account for the padding in the syscall table
++ */
++#ifdef __KERNEL__
++#define __NR_syscalls  (388)
++#endif
++
++/*
+  * *NOTE*: This is a ghost syscall private to the kernel.  Only the
+  * __kuser_cmpxchg code in entry-armv.S should be aware of its
+  * existence.  Don't ever use this from user code.
+diff --git a/arch/arm/kernel/calls.S b/arch/arm/kernel/calls.S
+index d01eb013b0ab..d76242b9b836 100644
+--- a/arch/arm/kernel/calls.S
++++ b/arch/arm/kernel/calls.S
+@@ -393,6 +393,7 @@
+ 		CALL(sys_ni_syscall)
+ 		CALL(sys_ni_syscall)
+ 		CALL(sys_seccomp)
++		CALL(sys_getrandom)
+ #ifndef syscalls_counted
+ .equ syscalls_padding, ((NR_syscalls + 3) & ~3) - NR_syscalls
+ #define syscalls_counted
+diff --git a/arch/x86/syscalls/syscall_32.tbl b/arch/x86/syscalls/syscall_32.tbl
+index 64e55260fbc6..76af9b354959 100644
+--- a/arch/x86/syscalls/syscall_32.tbl
++++ b/arch/x86/syscalls/syscall_32.tbl
+@@ -356,3 +356,4 @@
+ 347	i386	process_vm_readv	sys_process_vm_readv		compat_sys_process_vm_readv
+ 348	i386	process_vm_writev	sys_process_vm_writev		compat_sys_process_vm_writev
+ 354	i386	seccomp			sys_seccomp
++355	i386	getrandom		sys_getrandom
+diff --git a/arch/x86/syscalls/syscall_64.tbl b/arch/x86/syscalls/syscall_64.tbl
+index 9073c08114c8..d1c5a12358a8 100644
+--- a/arch/x86/syscalls/syscall_64.tbl
++++ b/arch/x86/syscalls/syscall_64.tbl
+@@ -319,6 +319,7 @@
+ 310	64	process_vm_readv	sys_process_vm_readv
+ 311	64	process_vm_writev	sys_process_vm_writev
+ 317	common	seccomp			sys_seccomp
++318	common	getrandom		sys_getrandom
+ 
+ #
+ # x32-specific system call numbers start at 512 to avoid cache impact
+diff --git a/drivers/char/random.c b/drivers/char/random.c
+index 4d8458f13196..10173ed64e82 100644
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@ -255,6 +255,8 @@
+ #include <linux/fips.h>
+ #include <linux/ptrace.h>
+ #include <linux/kmemcheck.h>
++#include <linux/syscalls.h>
++#include <linux/completion.h>
+ 
+ #ifdef CONFIG_GENERIC_HARDIRQS
+ # include <linux/irq.h>
+@@ -392,6 +394,7 @@ static struct poolinfo {
+  */
+ static DECLARE_WAIT_QUEUE_HEAD(random_read_wait);
+ static DECLARE_WAIT_QUEUE_HEAD(random_write_wait);
++static DECLARE_WAIT_QUEUE_HEAD(urandom_init_wait);
+ static struct fasync_struct *fasync;
+ 
+ #if 0
+@@ -593,10 +596,15 @@ static void credit_entropy_bits(struct entropy_store *r, int nbits)
+ 	if (cmpxchg(&r->entropy_count, orig, entropy_count) != orig)
+ 		goto retry;
+ 
+-	if (!r->initialized && nbits > 0) {
+-		r->entropy_total += nbits;
+-		if (r->entropy_total > 128)
+-			r->initialized = 1;
++	r->entropy_total += nbits;
++	if (!r->initialized && r->entropy_total > 128) {
++		r->initialized = 1;
++		r->entropy_total = 0;
++		if (r == &nonblocking_pool) {
++			prandom_reseed_late();
++			wake_up_all(&urandom_init_wait);
++			pr_notice("random: %s pool is initialized\n", r->name);
++		}
+ 	}
+ 
+ 	/* should we wake readers? */
+@@ -967,12 +975,13 @@ static ssize_t extract_entropy_user(struct entropy_store *r, void __user *buf,
+ {
+ 	ssize_t ret = 0, i;
+ 	__u8 tmp[EXTRACT_SIZE];
++	int large_request = (nbytes > 256);
+ 
+ 	xfer_secondary_pool(r, nbytes);
+ 	nbytes = account(r, nbytes, 0, 0);
+ 
+ 	while (nbytes) {
+-		if (need_resched()) {
++		if (large_request && need_resched()) {
+ 			if (signal_pending(current)) {
+ 				if (ret == 0)
+ 					ret = -ERESTARTSYS;
+@@ -1094,7 +1103,7 @@ void rand_initialize_disk(struct gendisk *disk)
+ #endif
+ 
+ static ssize_t
+-random_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
++_random_read(int nonblock, char __user *buf, size_t nbytes)
+ {
+ 	ssize_t n, retval = 0, count = 0;
+ 
+@@ -1114,7 +1123,7 @@ random_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
+ 			  n*8, (nbytes-n)*8);
+ 
+ 		if (n == 0) {
+-			if (file->f_flags & O_NONBLOCK) {
++			if (nonblock) {
+ 				retval = -EAGAIN;
+ 				break;
+ 			}
+@@ -1150,6 +1159,12 @@ random_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
+ }
+ 
+ static ssize_t
++random_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
++{
++	return _random_read(file->f_flags & O_NONBLOCK, buf, nbytes);
++}
++
++static ssize_t
+ urandom_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
+ {
+ 	return extract_entropy_user(&nonblocking_pool, buf, nbytes);
+@@ -1275,6 +1290,29 @@ const struct file_operations urandom_fops = {
+ 	.llseek = noop_llseek,
+ };
+ 
++SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count,
++		unsigned int, flags)
++{
++	if (flags & ~(GRND_NONBLOCK|GRND_RANDOM))
++		return -EINVAL;
++
++	if (count > INT_MAX)
++		count = INT_MAX;
++
++	if (flags & GRND_RANDOM)
++		return _random_read(flags & GRND_NONBLOCK, buf, count);
++
++	if (unlikely(nonblocking_pool.initialized == 0)) {
++		if (flags & GRND_NONBLOCK)
++			return -EAGAIN;
++		wait_event_interruptible(urandom_init_wait,
++					 nonblocking_pool.initialized);
++		if (signal_pending(current))
++			return -ERESTARTSYS;
++	}
++	return urandom_read(NULL, buf, count, NULL);
++}
++
+ /***************************************************************
+  * Random UUID interface
+  *
+diff --git a/drivers/scsi/fcoe/fcoe_ctlr.c b/drivers/scsi/fcoe/fcoe_ctlr.c
+index 249a106888d9..ea901d7fa820 100644
+--- a/drivers/scsi/fcoe/fcoe_ctlr.c
++++ b/drivers/scsi/fcoe/fcoe_ctlr.c
+@@ -2048,7 +2048,7 @@ static void fcoe_ctlr_vn_restart(struct fcoe_ctlr *fip)
+ 	 */
+ 	port_id = fip->port_id;
+ 	if (fip->probe_tries)
+-		port_id = prandom32(&fip->rnd_state) & 0xffff;
++		port_id = prandom_u32_state(&fip->rnd_state) & 0xffff;
+ 	else if (!port_id)
+ 		port_id = fip->lp->wwpn & 0xffff;
+ 	if (!port_id || port_id == 0xffff)
+@@ -2073,7 +2073,7 @@ static void fcoe_ctlr_vn_restart(struct fcoe_ctlr *fip)
+ static void fcoe_ctlr_vn_start(struct fcoe_ctlr *fip)
+ {
+ 	fip->probe_tries = 0;
+-	prandom32_seed(&fip->rnd_state, fip->lp->wwpn);
++	prandom_seed_state(&fip->rnd_state, fip->lp->wwpn);
+ 	fcoe_ctlr_vn_restart(fip);
+ }
+ 
+diff --git a/drivers/staging/android/uapi/binder.h b/drivers/staging/android/uapi/binder.h
+index 9153571407b6..52cd3f4f33cf 100644
+--- a/drivers/staging/android/uapi/binder.h
++++ b/drivers/staging/android/uapi/binder.h
+@@ -131,6 +131,7 @@ enum {
+ 
+ /* struct binder_fd_array_object - object describing an array of fds in a buffer
+  * @hdr:		common header structure
++ * @pad:		padding to ensure correct alignment
+  * @num_fds:		number of file descriptors in the buffer
+  * @parent:		index in offset array to buffer holding the fd array
+  * @parent_offset:	start offset of fd array in the buffer
+@@ -151,6 +152,7 @@ enum {
+  */
+ struct binder_fd_array_object {
+ 	struct binder_object_header	hdr;
++	__u32				pad;
+ 	binder_size_t			num_fds;
+ 	binder_size_t			parent;
+ 	binder_size_t			parent_offset;
+diff --git a/include/asm-generic/unistd.h b/include/asm-generic/unistd.h
+index ae8513b32af3..440c728d48de 100644
+--- a/include/asm-generic/unistd.h
++++ b/include/asm-generic/unistd.h
+@@ -693,9 +693,11 @@ __SC_COMP(__NR_process_vm_writev, sys_process_vm_writev, \
+           compat_sys_process_vm_writev)
+ #define __NR_seccomp 277
+ __SYSCALL(__NR_seccomp, sys_seccomp)
++#define __NR_getrandom 278
++__SYSCALL(__NR_getrandom, sys_getrandom)
+ 
+ #undef __NR_syscalls
+-#define __NR_syscalls 278
++#define __NR_syscalls 279
+ 
+ /*
+  * All syscalls below here should go away really,
+diff --git a/include/linux/random.h b/include/linux/random.h
+index ac621ce886ca..40c281c044c9 100644
+--- a/include/linux/random.h
++++ b/include/linux/random.h
+@@ -46,6 +46,15 @@ struct rnd_state {
+ 
+ /* Exported functions */
+ 
++/*
++ * Flags for getrandom(2)
++ *
++ * GRND_NONBLOCK	Don't block and return EAGAIN instead
++ * GRND_RANDOM		Use the /dev/random pool instead of /dev/urandom
++ */
++#define GRND_NONBLOCK	0x0001
++#define GRND_RANDOM	0x0002
++
+ #ifdef __KERNEL__
+ 
+ extern void add_device_randomness(const void *, unsigned int);
+@@ -64,10 +73,20 @@ extern const struct file_operations random_fops, urandom_fops;
+ unsigned int get_random_int(void);
+ unsigned long randomize_range(unsigned long start, unsigned long end, unsigned long len);
+ 
+-u32 random32(void);
+-void srandom32(u32 seed);
++u32 prandom_u32(void);
++void prandom_bytes(void *buf, int nbytes);
++void prandom_seed(u32 seed);
++void prandom_reseed_late(void);
++
++/*
++ * These macros are preserved for backward compatibility and should be
++ * removed as soon as a transition is finished.
++ */
++#define random32() prandom_u32()
++#define srandom32(seed) prandom_seed(seed)
+ 
+-u32 prandom32(struct rnd_state *);
++u32 prandom_u32_state(struct rnd_state *);
++void prandom_bytes_state(struct rnd_state *state, void *buf, int nbytes);
+ 
+ /*
+  * Handle minimum values for seeds
+@@ -78,17 +97,17 @@ static inline u32 __seed(u32 x, u32 m)
+ }
+ 
+ /**
+- * prandom32_seed - set seed for prandom32().
++ * prandom_seed_state - set seed for prandom_u32_state().
+  * @state: pointer to state structure to receive the seed.
+  * @seed: arbitrary 64-bit value to use as a seed.
+  */
+-static inline void prandom32_seed(struct rnd_state *state, u64 seed)
++static inline void prandom_seed_state(struct rnd_state *state, u64 seed)
+ {
+ 	u32 i = (seed >> 32) ^ (seed << 10) ^ seed;
+ 
+-	state->s1 = __seed(i, 1);
+-	state->s2 = __seed(i, 7);
+-	state->s3 = __seed(i, 15);
++	state->s1 = __seed(i, 2);
++	state->s2 = __seed(i, 8);
++	state->s3 = __seed(i, 16);
+ }
+ 
+ #ifdef CONFIG_ARCH_RANDOM
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index da352d5a2718..bd9ef27c22ed 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -860,4 +860,8 @@ asmlinkage long sys_process_vm_writev(pid_t pid,
+ 
+ asmlinkage long sys_seccomp(unsigned int op, unsigned int flags,
+ 			    const char __user *uargs);
++
++asmlinkage long sys_getrandom(char __user *buf, size_t count,
++			      unsigned int flags);
++
+ #endif
+diff --git a/lib/random32.c b/lib/random32.c
+index 938bde5876ac..6fb48477901c 100644
+--- a/lib/random32.c
++++ b/lib/random32.c
+@@ -38,17 +38,18 @@
+ #include <linux/export.h>
+ #include <linux/jiffies.h>
+ #include <linux/random.h>
++#include <linux/timer.h>
+ 
+ static DEFINE_PER_CPU(struct rnd_state, net_rand_state);
+ 
+ /**
+- *	prandom32 - seeded pseudo-random number generator.
++ *	prandom_u32_state - seeded pseudo-random number generator.
+  *	@state: pointer to state structure holding seeded state.
+  *
+  *	This is used for pseudo-randomness with no outside seeding.
+- *	For more random results, use random32().
++ *	For more random results, use prandom_u32().
+  */
+-u32 prandom32(struct rnd_state *state)
++u32 prandom_u32_state(struct rnd_state *state)
+ {
+ #define TAUSWORTHE(s,a,b,c,d) ((s&c)<<d) ^ (((s <<a) ^ s)>>b)
+ 
+@@ -58,32 +59,81 @@ u32 prandom32(struct rnd_state *state)
+ 
+ 	return (state->s1 ^ state->s2 ^ state->s3);
+ }
+-EXPORT_SYMBOL(prandom32);
++EXPORT_SYMBOL(prandom_u32_state);
+ 
+ /**
+- *	random32 - pseudo random number generator
++ *	prandom_u32 - pseudo random number generator
+  *
+  *	A 32 bit pseudo-random number is generated using a fast
+  *	algorithm suitable for simulation. This algorithm is NOT
+  *	considered safe for cryptographic use.
+  */
+-u32 random32(void)
++u32 prandom_u32(void)
+ {
+ 	unsigned long r;
+ 	struct rnd_state *state = &get_cpu_var(net_rand_state);
+-	r = prandom32(state);
++	r = prandom_u32_state(state);
+ 	put_cpu_var(state);
+ 	return r;
+ }
+-EXPORT_SYMBOL(random32);
++EXPORT_SYMBOL(prandom_u32);
++
++/*
++ *	prandom_bytes_state - get the requested number of pseudo-random bytes
++ *
++ *	@state: pointer to state structure holding seeded state.
++ *	@buf: where to copy the pseudo-random bytes to
++ *	@bytes: the requested number of bytes
++ *
++ *	This is used for pseudo-randomness with no outside seeding.
++ *	For more random results, use prandom_bytes().
++ */
++void prandom_bytes_state(struct rnd_state *state, void *buf, int bytes)
++{
++	unsigned char *p = buf;
++	int i;
++
++	for (i = 0; i < round_down(bytes, sizeof(u32)); i += sizeof(u32)) {
++		u32 random = prandom_u32_state(state);
++		int j;
++
++		for (j = 0; j < sizeof(u32); j++) {
++			p[i + j] = random;
++			random >>= BITS_PER_BYTE;
++		}
++	}
++	if (i < bytes) {
++		u32 random = prandom_u32_state(state);
++
++		for (; i < bytes; i++) {
++			p[i] = random;
++			random >>= BITS_PER_BYTE;
++		}
++	}
++}
++EXPORT_SYMBOL(prandom_bytes_state);
++
++/**
++ *	prandom_bytes - get the requested number of pseudo-random bytes
++ *	@buf: where to copy the pseudo-random bytes to
++ *	@bytes: the requested number of bytes
++ */
++void prandom_bytes(void *buf, int bytes)
++{
++	struct rnd_state *state = &get_cpu_var(net_rand_state);
++
++	prandom_bytes_state(state, buf, bytes);
++	put_cpu_var(state);
++}
++EXPORT_SYMBOL(prandom_bytes);
+ 
+ /**
+- *	srandom32 - add entropy to pseudo random number generator
++ *	prandom_seed - add entropy to pseudo random number generator
+  *	@seed: seed value
+  *
+- *	Add some additional seeding to the random32() pool.
++ *	Add some additional seeding to the prandom pool.
+  */
+-void srandom32(u32 entropy)
++void prandom_seed(u32 entropy)
+ {
+ 	int i;
+ 	/*
+@@ -92,16 +142,17 @@ void srandom32(u32 entropy)
+ 	 */
+ 	for_each_possible_cpu (i) {
+ 		struct rnd_state *state = &per_cpu(net_rand_state, i);
+-		state->s1 = __seed(state->s1 ^ entropy, 1);
++		state->s1 = __seed(state->s1 ^ entropy, 2);
++		prandom_u32_state(state);
+ 	}
+ }
+-EXPORT_SYMBOL(srandom32);
++EXPORT_SYMBOL(prandom_seed);
+ 
+ /*
+  *	Generate some initially weak seeding values to allow
+- *	to start the random32() engine.
++ *	to start the prandom_u32() engine.
+  */
+-static int __init random32_init(void)
++static int __init prandom_init(void)
+ {
+ 	int i;
+ 
+@@ -109,42 +160,85 @@ static int __init random32_init(void)
+ 		struct rnd_state *state = &per_cpu(net_rand_state,i);
+ 
+ #define LCG(x)	((x) * 69069)	/* super-duper LCG */
+-		state->s1 = __seed(LCG(i + jiffies), 1);
+-		state->s2 = __seed(LCG(state->s1), 7);
+-		state->s3 = __seed(LCG(state->s2), 15);
++		state->s1 = __seed(LCG(i + jiffies), 2);
++		state->s2 = __seed(LCG(state->s1), 8);
++		state->s3 = __seed(LCG(state->s2), 16);
+ 
+ 		/* "warm it up" */
+-		prandom32(state);
+-		prandom32(state);
+-		prandom32(state);
+-		prandom32(state);
+-		prandom32(state);
+-		prandom32(state);
++		prandom_u32_state(state);
++		prandom_u32_state(state);
++		prandom_u32_state(state);
++		prandom_u32_state(state);
++		prandom_u32_state(state);
++		prandom_u32_state(state);
+ 	}
+ 	return 0;
+ }
+-core_initcall(random32_init);
++core_initcall(prandom_init);
++
++static void __prandom_timer(unsigned long dontcare);
++static DEFINE_TIMER(seed_timer, __prandom_timer, 0, 0);
++
++static void __prandom_timer(unsigned long dontcare)
++{
++	u32 entropy;
++
++	get_random_bytes(&entropy, sizeof(entropy));
++	prandom_seed(entropy);
++	/* reseed every ~60 seconds, in [40 .. 80) interval with slack */
++	seed_timer.expires = jiffies + (40 * HZ + (prandom_u32() % (40 * HZ)));
++	add_timer(&seed_timer);
++}
++
++static void prandom_start_seed_timer(void)
++{
++	set_timer_slack(&seed_timer, HZ);
++	seed_timer.expires = jiffies + 40 * HZ;
++	add_timer(&seed_timer);
++}
+ 
+ /*
+  *	Generate better values after random number generator
+  *	is fully initialized.
+  */
+-static int __init random32_reseed(void)
++static void __prandom_reseed(bool late)
+ {
+ 	int i;
++	unsigned long flags;
++	static bool latch = false;
++	static DEFINE_SPINLOCK(lock);
++
++	/* only allow initial seeding (late == false) once */
++	spin_lock_irqsave(&lock, flags);
++	if (latch && !late)
++		goto out;
++	latch = true;
+ 
+ 	for_each_possible_cpu(i) {
+ 		struct rnd_state *state = &per_cpu(net_rand_state,i);
+ 		u32 seeds[3];
+ 
+ 		get_random_bytes(&seeds, sizeof(seeds));
+-		state->s1 = __seed(seeds[0], 1);
+-		state->s2 = __seed(seeds[1], 7);
+-		state->s3 = __seed(seeds[2], 15);
++		state->s1 = __seed(seeds[0], 2);
++		state->s2 = __seed(seeds[1], 8);
++		state->s3 = __seed(seeds[2], 16);
+ 
+ 		/* mix it in */
+-		prandom32(state);
++		prandom_u32_state(state);
+ 	}
++out:
++	spin_unlock_irqrestore(&lock, flags);
++}
++
++void prandom_reseed_late(void)
++{
++	__prandom_reseed(true);
++}
++
++static int __init prandom_reseed(void)
++{
++	__prandom_reseed(false);
++	prandom_start_seed_timer();
+ 	return 0;
+ }
+-late_initcall(random32_reseed);
++late_initcall(prandom_reseed);
