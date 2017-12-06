@@ -1,0 +1,189 @@
+From f42187ef9aa4424db1c8c7355a0e3df3b03f84e2 Mon Sep 17 00:00:00 2001
+From: yatto <yattodettaman@hotmail.com>
+Date: Thu, 9 Nov 2017 18:37:23 +0100
+Subject: [PATCH] update to 4315ddc
+
+---
+ arch/arm/include/asm/uaccess.h            | 20 ++++++++++++++++-
+ arch/arm/lib/getuser.S                    | 37 ++++++++++++++++++++++++++++++-
+ drivers/staging/android/Kconfig           |  5 +++--
+ drivers/staging/android/binder.c          |  9 ++++----
+ 4 files changed, 63 insertions(+), 8 deletions(-)
+
+diff --git a/arch/arm/include/asm/uaccess.h b/arch/arm/include/asm/uaccess.h
+index 0a070e98625d..b37191798db8 100644
+--- a/arch/arm/include/asm/uaccess.h
++++ b/arch/arm/include/asm/uaccess.h
+@@ -100,6 +100,8 @@ static inline void set_fs(mm_segment_t fs)
+ extern int __get_user_1(void *);
+ extern int __get_user_2(void *);
+ extern int __get_user_4(void *);
++extern int __get_user_lo8(void *);
++extern int __get_user_8(void *);
+ 
+ #define __GUP_CLOBBER_1	"lr", "cc"
+ #ifdef CONFIG_CPU_USE_DOMAINS
+@@ -108,6 +110,8 @@ extern int __get_user_4(void *);
+ #define __GUP_CLOBBER_2 "lr", "cc"
+ #endif
+ #define __GUP_CLOBBER_4	"lr", "cc"
++#define __GUP_CLOBBER_lo8 "lr", "cc"
++#define __GUP_CLOBBER_8	"lr", "cc"
+ 
+ #define __get_user_x(__r2,__p,__e,__l,__s)				\
+ 	   __asm__ __volatile__ (					\
+@@ -118,11 +122,19 @@ extern int __get_user_4(void *);
+ 		: "0" (__p), "r" (__l)					\
+ 		: __GUP_CLOBBER_##__s)
+ 
++/* narrowing a double-word get into a single 32bit word register: */
++#ifdef __ARMEB__
++#define __get_user_xb(__r2, __p, __e, __l, __s)				\
++	__get_user_x(__r2, __p, __e, __l, lo8)
++#else
++#define __get_user_xb __get_user_x
++#endif
++
+ #define get_user(x,p)							\
+ 	({								\
+ 		unsigned long __limit = current_thread_info()->addr_limit - 1; \
+ 		register const typeof(*(p)) __user *__p asm("r0") = (p);\
+-		register unsigned long __r2 asm("r2");			\
++		register typeof(x) __r2 asm("r2");			\
+ 		register unsigned long __l asm("r1") = __limit;		\
+ 		register int __e asm("r0");				\
+ 		switch (sizeof(*(__p))) {				\
+@@ -135,6 +147,12 @@ extern int __get_user_4(void *);
+ 		case 4:							\
+ 			__get_user_x(__r2, __p, __e, __l, 4);		\
+ 			break;						\
++		case 8:							\
++			if (sizeof((x)) < 8)				\
++				__get_user_xb(__r2, __p, __e, __l, 4);	\
++			else						\
++				__get_user_x(__r2, __p, __e, __l, 8);	\
++			break;						\
+ 		default: __e = __get_user_bad(); break;			\
+ 		}							\
+ 		x = (typeof(*(p))) __r2;				\
+diff --git a/arch/arm/lib/getuser.S b/arch/arm/lib/getuser.S
+index 9b06bb41fca6..82b024a13051 100644
+--- a/arch/arm/lib/getuser.S
++++ b/arch/arm/lib/getuser.S
+@@ -18,7 +18,7 @@
+  * Inputs:	r0 contains the address
+  *		r1 contains the address limit, which must be preserved
+  * Outputs:	r0 is the error code
+- *		r2 contains the zero-extended value
++ *		r2, r3 contains the zero-extended value
+  *		lr corrupted
+  *
+  * No other registers must be altered.  (see <asm/uaccess.h>
+@@ -66,15 +66,50 @@ ENTRY(__get_user_4)
+ 	mov	pc, lr
+ ENDPROC(__get_user_4)
+ 
++ENTRY(__get_user_8)
++	check_uaccess r0, 8, r1, r2, __get_user_bad
++#ifdef CONFIG_THUMB2_KERNEL
++5: TUSER(ldr)	r2, [r0]
++6: TUSER(ldr)	r3, [r0, #4]
++#else
++5: TUSER(ldr)	r2, [r0], #4
++6: TUSER(ldr)	r3, [r0]
++#endif
++	mov	r0, #0
++	mov	pc, lr
++ENDPROC(__get_user_8)
++
++#ifdef __ARMEB__
++ENTRY(__get_user_lo8)
++	check_uaccess r0, 8, r1, r2, __get_user_bad
++#ifdef CONFIG_CPU_USE_DOMAINS
++	add	r0, r0, #4
++7:	ldrt	r2, [r0]
++#else
++7:	ldr	r2, [r0, #4]
++#endif
++	mov	r0, #0
++	mov	pc, lr
++ENDPROC(__get_user_lo8)
++#endif
++
++__get_user_bad8:
++	mov	r3, #0
+ __get_user_bad:
+ 	mov	r2, #0
+ 	mov	r0, #-EFAULT
+ 	mov	pc, lr
+ ENDPROC(__get_user_bad)
++ENDPROC(__get_user_bad8)
+ 
+ .pushsection __ex_table, "a"
+ 	.long	1b, __get_user_bad
+ 	.long	2b, __get_user_bad
+ 	.long	3b, __get_user_bad
+ 	.long	4b, __get_user_bad
++	.long	5b, __get_user_bad8
++	.long	6b, __get_user_bad8
++#ifdef __ARMEB__
++	.long   7b, __get_user_bad
++#endif
+ .popsection
+diff --git a/drivers/staging/android/Kconfig b/drivers/staging/android/Kconfig
+index a4dddaa05630..3bed89cc1f1f 100644
+--- a/drivers/staging/android/Kconfig
++++ b/drivers/staging/android/Kconfig
+@@ -13,8 +13,9 @@ config ANDROID_BINDER_IPC
+ 	default n
+ 
+ config ANDROID_BINDER_IPC_32BIT
+-	bool "Use old 32-bit binder api"
+-	depends on !64BIT
++	bool "Use old (Android 4.4 and earlier) 32-bit binder API"
++	depends on !64BIT && ANDROID_BINDER_IPC
++	default y
+ 	---help---
+ 	  Enable to support an old 32-bit Android user-space. Breaks the new
+ 	  Android user-space.
+diff --git a/drivers/staging/android/binder.c b/drivers/staging/android/binder.c
+index 04318164cab8..22f14eee7d9a 100644
+--- a/drivers/staging/android/binder.c
++++ b/drivers/staging/android/binder.c
+@@ -1630,7 +1630,8 @@ static void binder_transaction_buffer_release(struct binder_proc *proc,
+ 				       debug_id, (u64)fda->num_fds);
+ 				continue;
+ 			}
+-			fd_array = (u32 *)(parent_buffer + fda->parent_offset);
++			fd_array = (u32 *)(uintptr_t)
++				(parent_buffer + fda->parent_offset);
+ 			for (fd_index = 0; fd_index < fda->num_fds; fd_index++)
+ 				task_close_fd(proc, fd_array[fd_index]);
+ 		} break;
+@@ -1834,7 +1835,7 @@ static int binder_translate_fd_array(struct binder_fd_array_object *fda,
+ 	 * back to the kernel address space to access it
+ 	 */
+ 	parent_buffer = parent->buffer - target_proc->user_buffer_offset;
+-	fd_array = (u32 *)(parent_buffer + fda->parent_offset);
++	fd_array = (u32 *)(uintptr_t)(parent_buffer + fda->parent_offset);
+ 	if (!IS_ALIGNED((unsigned long)fd_array, sizeof(u32))) {
+ 		binder_user_error("%d:%d parent offset not aligned correctly.\n",
+ 				  proc->pid, thread->pid);
+@@ -1900,7 +1901,7 @@ static int binder_fixup_parent(struct binder_transaction *t,
+ 				  proc->pid, thread->pid);
+ 		return -EINVAL;
+ 	}
+-	parent_buffer = (u8 *)(parent->buffer -
++	parent_buffer = (u8 *)(uintptr_t)(parent->buffer -
+ 			       target_proc->user_buffer_offset);
+ 	*(binder_uintptr_t *)(parent_buffer + bp->parent_offset) = bp->buffer;
+ 
+@@ -2665,7 +2666,7 @@ static int binder_thread_write(struct binder_proc *proc,
+ 			if (get_user(cookie, (binder_uintptr_t __user *)ptr))
+ 				return -EFAULT;
+ 
+-			ptr += sizeof(void *);
++			ptr += sizeof(cookie);
+ 			list_for_each_entry(w, &proc->delivered_death, entry) {
+ 				struct binder_ref_death *tmp_death = container_of(w, struct binder_ref_death, work);
+ 				if (tmp_death->cookie == cookie) {
